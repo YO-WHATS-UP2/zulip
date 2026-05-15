@@ -2867,3 +2867,91 @@ class EditMessageTest(ZulipTestCase):
             ),
             {hamlet.id},
         )
+
+    def test_delete_message_edit_history(self) -> None:
+        hamlet = self.example_user("hamlet")
+
+        # Send and edit a message
+        msg_id = self.send_stream_message(
+            hamlet,
+            "Denmark",
+            topic_name="test topic",
+            content="original content",
+        )
+        self.login("hamlet")
+        result = self.client_patch(
+            f"/json/messages/{msg_id}",
+            {"content": "edited content"},
+        )
+        self.assert_json_success(result)
+
+        # Admin can delete edit history
+        self.login("iago")
+        result = self.client_delete(f"/json/messages/{msg_id}/history")
+        self.assert_json_success(result)
+
+        # Verify content is removed from history
+        history = self.client_get(f"/json/messages/{msg_id}/history")
+        history_data = orjson.loads(history.content)
+        self.assertFalse(any("prev_content" in entry for entry in history_data["message_history"]))
+
+        # Verify audit entry exists
+        self.assertTrue(
+            any("history_deleted_by" in entry for entry in history_data["message_history"])
+        )
+
+        # Non-admin cannot delete edit history
+        self.login("cordelia")
+        result = self.client_delete(f"/json/messages/{msg_id}/history")
+        self.assert_json_error(result, "You don't have permission to delete this message")
+
+        # Cannot delete history with no content edits
+        msg_id_no_edit = self.send_stream_message(
+            hamlet, "Denmark", topic_name="test topic", content="no edits"
+        )
+        self.login("iago")
+        result = self.client_delete(f"/json/messages/{msg_id_no_edit}/history")
+        self.assert_json_error(result, "This message has no edit history to delete.")
+
+        # Cannot delete history if only topic was edited (no content edits)
+        msg_id_topic_only = self.send_stream_message(
+            hamlet, "Denmark", topic_name="original topic", content="some content"
+        )
+        self.login("hamlet")
+        result = self.client_patch(
+            f"/json/messages/{msg_id_topic_only}",
+            {"topic": "new topic"},
+        )
+        self.assert_json_success(result)
+        self.login("iago")
+        result = self.client_delete(f"/json/messages/{msg_id_topic_only}/history")
+        self.assert_json_error(result, "This message has no content edits to delete.")
+
+        # Move-only edit history entries are not modified when deleting history
+        msg_id_mixed = self.send_stream_message(
+            hamlet, "Denmark", topic_name="original topic", content="original content"
+        )
+        self.login("hamlet")
+        result = self.client_patch(
+            f"/json/messages/{msg_id_mixed}",
+            {"content": "edited content"},
+        )
+        self.assert_json_success(result)
+        result = self.client_patch(
+            f"/json/messages/{msg_id_mixed}",
+            {"topic": "moved topic"},
+        )
+        self.assert_json_success(result)
+        self.login("iago")
+        result = self.client_delete(f"/json/messages/{msg_id_mixed}/history")
+        self.assert_json_success(result)
+        history = self.client_get(f"/json/messages/{msg_id_mixed}/history")
+        history_data = orjson.loads(history.content)["message_history"]
+        # Content-edit entry has prev_content stripped and history_deleted_by set
+        content_entries = [
+            e for e in history_data if "prev_content" not in e and "history_deleted_by" in e
+        ]
+        self.assertGreater(len(content_entries), 0)
+        # Move-only entry is unchanged: no history_deleted_by
+        move_entries = [e for e in history_data if "prev_topic" in e and "prev_content" not in e]
+        self.assertTrue(all("history_deleted_by" not in e for e in move_entries))

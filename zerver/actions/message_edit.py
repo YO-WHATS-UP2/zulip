@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+import orjson
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Q, QuerySet
@@ -1849,6 +1850,49 @@ def check_update_message(
             notify_stream_is_recently_active_update(new_stream, is_stream_active)
 
     return updated_message_result
+
+
+@transaction.atomic(durable=True)
+def do_delete_message_edit_history(
+    message: Message,
+    acting_user: UserProfile,
+) -> None:
+    """
+    Strips prev_content from all edit history entries and inserts
+    an audit record noting who deleted the history.
+    """
+    if message.edit_history is None:  # nocoverage
+        return
+
+    edit_history: list[EditHistoryEvent] = orjson.loads(message.edit_history)
+
+    # Remove content fields from content-edit entries and mark them as deleted.
+    # Move-only entries (no prev_content) are left untouched so they don't
+    # affect last_edit_timestamp calculations on the frontend.
+    for entry in edit_history:
+        if "prev_content" not in entry:
+            continue
+        entry.pop("prev_content")
+        entry.pop("prev_rendered_content", None)
+        entry.pop("prev_rendered_content_version", None)
+        entry["history_deleted_by"] = acting_user.id
+
+    message.edit_history = orjson.dumps(edit_history).decode()
+    message.save(update_fields=["edit_history"])
+
+    # Send event so frontend keeps (edited) indicator and updates message state
+    event = {
+        "type": "update_message",
+        "user_id": acting_user.id,
+        "edit_timestamp": datetime_to_timestamp(timezone_now()),
+        "message_id": message.id,
+        "message_ids": [message.id],
+        "rendering_only": False,
+        "edit_history_deleted": True,
+    }
+    ums = UserMessage.objects.filter(message=message.id)
+    users = [{"id": um.user_profile_id, "flags": um.flags_list()} for um in ums]
+    send_event_on_commit(acting_user.realm, event, users)
 
 
 @transaction.atomic(durable=True)

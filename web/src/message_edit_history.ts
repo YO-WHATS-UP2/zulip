@@ -2,14 +2,18 @@ import $ from "jquery";
 import assert from "minimalistic-assert";
 import * as z from "zod/mini";
 
+import render_confirm_delete_edit_history from "../templates/confirm_dialog/confirm_delete_edit_history.hbs";
 import render_message_edit_history from "../templates/message_edit_history.hbs";
 import render_message_history_overlay from "../templates/message_history_overlay.hbs";
 
 import {exit_overlay} from "./browser_history.ts";
 import * as channel from "./channel.ts";
+import * as confirm_dialog from "./confirm_dialog.ts";
 import {$t, $t_html} from "./i18n.ts";
 import * as loading from "./loading.ts";
+import * as message_delete from "./message_delete.ts";
 import * as message_lists from "./message_lists.ts";
+import * as message_store from "./message_store.ts";
 import type {Message} from "./message_store.ts";
 import * as messages_overlay_ui from "./messages_overlay_ui.ts";
 import * as overlays from "./overlays.ts";
@@ -45,6 +49,7 @@ type EditHistoryEntry = {
     prev_stream: string | undefined;
     prev_stream_id: number | undefined;
     new_stream: string | undefined;
+    history_deleted_by_mention_html: string | undefined;
 };
 
 const server_message_history_schema = z.object({
@@ -61,6 +66,7 @@ const server_message_history_schema = z.object({
             prev_content: z.optional(z.string()),
             prev_rendered_content: z.optional(z.string()),
             content_html_diff: z.optional(z.string()),
+            history_deleted_by: z.optional(z.number()),
         }),
     ),
 });
@@ -114,22 +120,10 @@ function hide_loading_indicator(): void {
     );
 }
 
-export function fetch_and_render_message_history(message: Message): void {
-    assert(message_lists.current !== undefined);
-    const message_container = message_lists.current.view.message_containers.get(message.id);
-    assert(message_container !== undefined);
+function refresh_edit_history(message: Message): void {
     const move_history_only =
         realm.realm_message_edit_history_visibility_policy ===
         message_edit_history_visibility_policy_values.moves_only.code;
-    $("#message-edit-history-overlay-container").html(
-        render_message_history_overlay({
-            moved: message_container.moved,
-            edited: message_container.edited,
-            move_history_only,
-        }),
-    );
-    $("#message-edit-history-overlay-container").attr("data-message-id", message.id);
-    open_overlay();
     show_loading_indicator();
     void channel.get({
         url: "/json/messages/" + message.id + "/history",
@@ -174,14 +168,17 @@ export function fetch_and_render_message_history(message: Message): void {
                 let initial_entry_for_move_history = false;
 
                 if (index === 0) {
+                    const history_deleted = data.message_history.some(
+                        (entry) => entry.history_deleted_by !== undefined,
+                    );
                     edited_by_notice = $t({defaultMessage: "Posted by {full_name}"}, {full_name});
                     if (move_history_only) {
                         // If message history is limited to moves only, then we
                         // display the original topic and channel for the message.
                         initial_entry_for_move_history = true;
                         new_topic_display_name = util.get_final_topic_display_name(msg.topic);
-                    } else {
-                        // Otherwise, we display the original message content.
+                    } else if (!history_deleted) {
+                        // Only show content if history has not been deleted.
                         body_to_render = msg.rendered_content;
                     }
                 } else if (msg.prev_topic !== undefined && msg.prev_content) {
@@ -220,10 +217,17 @@ export function fetch_and_render_message_history(message: Message): void {
                     if (prev_stream_item !== null) {
                         prev_stream_item.new_stream = get_display_stream_name(msg.prev_stream);
                     }
-                } else {
-                    // just a content edit
+                } else if (msg.history_deleted_by !== undefined) {
+                    edited_by_notice = $t({defaultMessage: "Edited by {full_name}"}, {full_name});
+                    // Last edited entry: show current message content after history deletion.
+                    if (index === data.message_history.length - 1) {
+                        body_to_render = msg.rendered_content;
+                    }
+                } else if (msg.content_html_diff !== undefined) {
                     edited_by_notice = $t({defaultMessage: "Edited by {full_name}"}, {full_name});
                     body_to_render = msg.content_html_diff;
+                } else {
+                    continue;
                 }
                 const item: EditHistoryEntry = {
                     initial_entry_for_move_history,
@@ -242,6 +246,14 @@ export function fetch_and_render_message_history(message: Message): void {
                     prev_stream,
                     prev_stream_id,
                     new_stream: undefined,
+                    history_deleted_by_mention_html:
+                        msg.history_deleted_by !== undefined &&
+                        index !== data.message_history.length - 1
+                            ? `<span class="user-mention silent" data-user-id="${msg.history_deleted_by}">${people.get_user_by_id_assert_valid(msg.history_deleted_by).full_name}</span>`
+                            : index === 0 &&
+                                data.message_history.some((e) => e.history_deleted_by !== undefined)
+                              ? `<span class="user-mention silent" data-user-id="${data.message_history.find((e) => e.history_deleted_by !== undefined)!.history_deleted_by}">${people.get_user_by_id_assert_valid(data.message_history.find((e) => e.history_deleted_by !== undefined)!.history_deleted_by!).full_name}</span>`
+                              : undefined,
                 };
 
                 if (msg.prev_stream) {
@@ -289,6 +301,18 @@ export function fetch_and_render_message_history(message: Message): void {
             });
             $("#message-history-overlay").attr("data-message-id", message.id);
             hide_loading_indicator();
+            // Hide delete button if history was already deleted
+            // and no new content edits have happened since.
+            // Skip index 0 (Posted by entry) as it always has body_to_render.
+            const already_deleted = data.message_history.some(
+                (entry) => entry.history_deleted_by !== undefined,
+            );
+            const has_new_content_edit_after_deletion = data.message_history.some(
+                (entry) => entry.prev_content !== undefined,
+            );
+            if (already_deleted && !has_new_content_edit_after_deletion) {
+                $(".delete-edit-history-button").hide();
+            }
             $("#message-history-overlay .overlay-messages-list").append($(rendered_list_html));
 
             // Pass the history through rendered_markdown.ts
@@ -331,6 +355,27 @@ export function fetch_and_render_message_history(message: Message): void {
             $("#message-history-error").show();
         },
     });
+}
+
+export function fetch_and_render_message_history(message: Message): void {
+    assert(message_lists.current !== undefined);
+    const message_container = message_lists.current.view.message_containers.get(message.id);
+    assert(message_container !== undefined);
+    const move_history_only =
+        realm.realm_message_edit_history_visibility_policy ===
+        message_edit_history_visibility_policy_values.moves_only.code;
+    $("#message-edit-history-overlay-container").html(
+        render_message_history_overlay({
+            moved: message_container.moved,
+            edited: message_container.edited,
+            move_history_only,
+            can_delete_history:
+                message_container.edited && message_delete.get_deletability(message),
+        }),
+    );
+    $("#message-edit-history-overlay-container").attr("data-message-id", message.id);
+    open_overlay();
+    refresh_edit_history(message);
 }
 
 export function open_overlay(): void {
@@ -432,5 +477,34 @@ export function initialize(): void {
 
     $("body").on("click", "#message-history-overlay .message_edit_history_content", (e) => {
         messages_overlay_ui.handle_overlay_media_click(e, "message_edit_history");
+    });
+
+    $("body").on("click", ".delete-edit-history-button", () => {
+        const message_id = $("#message-edit-history-overlay-container").attr("data-message-id");
+        assert(message_id !== undefined);
+
+        confirm_dialog.launch({
+            modal_title_html: $t_html({defaultMessage: "Delete prior versions of this message?"}),
+            modal_content_html: render_confirm_delete_edit_history({}),
+            on_click() {
+                void channel.del({
+                    url: "/json/messages/" + message_id + "/history",
+                    success() {
+                        const message = message_store.get(Number.parseInt(message_id, 10));
+                        if (message !== undefined) {
+                            $("#message-history-overlay .overlay-messages-list").empty();
+                            refresh_edit_history(message);
+                        }
+                    },
+                    error(xhr) {
+                        ui_report.error(
+                            $t_html({defaultMessage: "Error deleting message edit history."}),
+                            xhr,
+                            $("#message-history-overlay #message-history-error"),
+                        );
+                    },
+                });
+            },
+        });
     });
 }
